@@ -1,0 +1,351 @@
+#version: '3.8'
+
+# Kong Enterprise 3.14 - Hybrid Mode Deployment
+# Topology: Separated Control Plane, Data Plane (Gateway), and PostgreSQL Database
+#
+# Services:
+#   - postgres:           Database, used by CP only
+#   - kong-bootstrap:     One-time DB bootstrap, exits after completion
+#   - kong-control-plane: Management plane (admin API, Manager UI)
+#   - kong-gateway:       Data plane (API proxy, receives config from CP)
+#
+# Usage:
+#   podman-compose -f kong-enterprise-hybrid-compose.yml up -d
+#   podman-compose -f kong-enterprise-hybrid-compose.yml down
+#
+# PRE-REQUISITE — Generate shared cluster certificate ONCE before starting:
+#   mkdir -p certs
+#   openssl req -new -x509 -nodes \
+#     -newkey ec:<(openssl ecparam -name secp384r1) \
+#     -keyout ./certs/cluster-cert-key.pem \
+#     -out ./certs/cluster-cert.pem \
+#     -days 1095 -subj "/CN=kong_clustering"
+#   chmod 644 ./certs/cluster-cert.pem ./certs/cluster-cert-key.pem
+#
+# Notes:
+#   - Networks use dict format (not list) to support explicit aliases
+#   - Explicit aliases are required for reliable DNS in Podman
+#   - KONG_CLUSTER_MTLS: 'shared' = same cert/key on CP and DP
+
+services:
+  #=============================================================================
+  # PostgreSQL Database - Used by Control Plane
+  #=============================================================================
+  postgres:
+    image: postgres:17-alpine
+    container_name: kong-postgres
+    
+    environment:
+      POSTGRES_USER: kong
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-kong_secure_password}
+      POSTGRES_DB: kong
+      POSTGRES_INITDB_ARGS: >-
+        --encoding=UTF8
+        --locale=C
+    
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "kong", "-d", "kong"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    
+    # Volume for persistent data
+    volumes:
+      - kong_postgres_data:/var/lib/postgresql/data
+    
+    # Resource limits (adjust based on your system)
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 512M
+        reservations:
+          cpus: '0.5'
+          memory: 256M
+    
+    # Logging configuration
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+  
+    # Ports mapping
+    ports:
+      - "5432:5432"
+
+    # Dict format — required to set aliases for Podman DNS resolution
+    networks:
+      kong_admin:
+        aliases:
+          - postgres
+    
+    restart: unless-stopped
+
+  #=============================================================================
+  # Kong Bootstrap — Runs ONCE to bootstrap the database schema, then exits.
+  # Control Plane waits for this to complete before starting.
+  # Safe to re-run: 'bootstrap' is a no-op if schema is already up to date.
+  #=============================================================================
+  kong-bootstrap:
+    image: 'kong/kong-gateway:3.14.0.5-rhel'
+    container_name: kong-bootstrap
+    command: kong migrations bootstrap  # Run DB migrations to initialize Kong schema
+    
+    networks:
+      kong_admin:
+        aliases:
+          - kong-bootstrap
+    
+    depends_on:
+      postgres:
+        condition: service_healthy   # Wait until Postgres is up and healthy
+    
+    restart: "no"
+
+    environment:
+      KONG_DATABASE: postgres
+      KONG_PG_HOST: postgres
+      KONG_PG_PORT: 5432
+      KONG_PG_USER: kong
+      KONG_PG_PASSWORD: ${POSTGRES_PASSWORD:-kong_secure_password}
+      KONG_PG_DATABASE: kong
+      KONG_LICENSE_DATA: ${KONG_LICENSE_DATA}
+
+  # =============================================================================
+  # Kong Control Plane - Management Interface
+  # =============================================================================
+  kong-control-plane:
+    image: kong/kong-gateway:3.14.0.5-rhel
+    container_name: kong-control-plane
+    
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kong-bootstrap:
+        condition: service_completed_successfully
+    
+    environment:
+      # === Role Configuration ===
+      KONG_ROLE: control_plane
+      
+      # === Database Configuration ===
+      KONG_DATABASE: postgres
+      KONG_PG_HOST: postgres
+      KONG_PG_PORT: 5432
+      KONG_PG_USER: kong
+      KONG_PG_PASSWORD: ${POSTGRES_PASSWORD:-kong_secure_password}
+      KONG_PG_DATABASE: kong
+      
+      # === Enterprise License (REQUIRED) ===
+      # Replace this with your actual Kong Enterprise license key
+      KONG_LICENSE_DATA: ${KONG_LICENSE_DATA}
+      
+      # === Admin API Configuration ===
+      KONG_ADMIN_LISTEN: 0.0.0.0:8001
+      KONG_ADMIN_GUI_LISTEN: 0.0.0.0:8002
+      KONG_ADMIN_ACCESS_LOG: /dev/stdout
+      KONG_ADMIN_ERROR_LOG: /dev/stderr
+      
+      # === Cluster Configuration (CP-DP Communication) ===
+      KONG_CLUSTER_LISTEN: 0.0.0.0:8005
+      KONG_CLUSTER_ADVERTISE: 172.20.0.10:8005
+      
+      # Telemetry listen must match DP's KONG_CLUSTER_TELEMETRY_ENDPOINT
+      KONG_CLUSTER_TELEMETRY_LISTEN: 0.0.0.0:8006
+
+      # === Cluster mTLS ===
+      # shared for local dev — use 'pki' with real certs in production
+      KONG_CLUSTER_MTLS: shared
+      KONG_CLUSTER_CERT: /etc/kong/cluster-cert.pem
+      KONG_CLUSTER_CERT_KEY: /etc/kong/cluster-cert-key.pem
+
+      # === Logging Configuration ===
+      KONG_LOG_LEVEL: notice
+      
+      # === Security & Optimization ===
+      KONG_TRUSTED_IPS: 0.0.0.0/0
+      KONG_REAL_IP_HEADER: X-Forwarded-For
+      KONG_REAL_IP_RECURSIVE: 'off'
+    
+    healthcheck:
+      test: ["CMD", "kong", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    
+    # Ports mapping
+    ports:
+      # Admin API (configuration management)
+      - "8001:8001"
+      # Admin GUI / Manager (web dashboard)
+      - "8002:8002"
+      # Cluster communication port (CP-DP sync)
+      - "8005:8005"
+      # Cluster telemetry
+      - "8006:8006"
+    
+    # Volumes for certificates and configs
+    volumes:
+      # SSL certificates for cluster communication
+      # NOTE: Generate these with: kong generate-cert -d kong-control-plane
+      - ./certs/cluster-cert.pem:/etc/kong/cluster-cert.pem:ro
+      - ./certs/cluster-cert-key.pem:/etc/kong/cluster-cert-key.pem:ro
+    
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 1G
+        reservations:
+          cpus: '1'
+          memory: 512M
+    
+    # Logging configuration
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    
+    # Dict format with explicit alias — Podman uses this for DNS resolution
+    networks:
+      kong_admin:
+        ipv4_address: 172.20.0.10 # Static IP assigned — DP uses this IP directly, bypassing Podman DNS entirely
+        aliases:
+          - kong-control-plane
+    
+    restart: unless-stopped
+
+  #=============================================================================
+  # Kong Gateway (Data Plane) - API Proxy
+  #=============================================================================
+  kong-gateway:
+    image: kong/kong-gateway:3.14.0.5-rhel
+    container_name: kong-gateway
+    
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kong-control-plane:
+        condition: service_healthy
+    
+    environment:
+      # === Role Configuration ===
+      KONG_ROLE: data_plane
+      
+      # === DP in hybrid mode does not use DB directly — config comes from CP
+      KONG_DATABASE: "off"
+
+      # === Cluster mTLS ===
+      # shared for local dev — use 'pki' with real certs in production
+      KONG_CLUSTER_MTLS: shared
+      KONG_CLUSTER_CERT: /etc/kong/cluster-cert.pem
+      KONG_CLUSTER_CERT_KEY: /etc/kong/cluster-cert-key.pem
+      
+      # === Enterprise License (same as CP) ===
+      KONG_LICENSE_DATA: ${KONG_LICENSE_DATA}
+      
+      # === Cluster Configuration (DP connects to CP) ===
+      # KONG_CLUSTER_CONTROL_PLANE: kong-control-plane:8005
+      # KONG_CLUSTER_TELEMETRY_ENDPOINT: kong-control-plane:8006
+      KONG_CLUSTER_CONTROL_PLANE: 172.20.0.10:8005
+      KONG_CLUSTER_TELEMETRY_ENDPOINT: 172.20.0.10:8006
+      
+      # === Proxy Configuration ===
+      KONG_PROXY_LISTEN: 0.0.0.0:8000
+      KONG_PROXY_LISTEN_SSL: 0.0.0.0:8443
+      KONG_PROXY_ACCESS_LOG: /dev/stdout
+      KONG_PROXY_ERROR_LOG: /dev/stderr
+      
+      # === Logging Configuration ===
+      KONG_LOG_LEVEL: notice
+      
+      # === Security & Optimization ===
+      KONG_TRUSTED_IPS: 0.0.0.0/0
+      KONG_REAL_IP_HEADER: X-Forwarded-For
+      KONG_REAL_IP_RECURSIVE: 'off'
+
+      # === DNS Configuration ===
+      KONG_DNS_RESOLVER: 1.1.1.1,8.8.8.8  # use public DNS directly
+      KONG_DNS_ORDER: SRV,A,CNAME               # removed LAST — never fall back
+      KONG_NEW_DNS_CLIENT: "on"
+
+    healthcheck:
+      test: ["CMD", "kong", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    
+    # Ports mapping
+    ports:
+      # HTTP proxy port
+      - "8000:8000"
+      # HTTPS proxy port
+      - "8443:8443"
+      # Cluster communication (for cluster metrics)
+      #- "8005:8005"
+    
+    # Volumes for certificates
+    volumes:
+      # SSL certificates for cluster communication (same as CP)
+      - ./certs/cluster-cert.pem:/etc/kong/cluster-cert.pem:ro
+      - ./certs/cluster-cert-key.pem:/etc/kong/cluster-cert-key.pem:ro
+    
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 1G
+        reservations:
+          cpus: '1'
+          memory: 512M
+    
+    # Logging configuration
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    
+    # Dict format — two networks, each with an explicit alias
+    networks:
+      kong_admin:
+        aliases:
+          - kong-gateway
+      kong_proxy:
+        aliases:
+          - kong-gateway
+    
+    restart: unless-stopped
+
+#=============================================================================
+# Networks
+#=============================================================================
+networks:
+  # Private network for CP-DP communication and database
+  kong_admin:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+  
+  # Public network for external API clients
+  kong_proxy:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.21.0.0/16
+
+#=============================================================================
+# Volumes
+#=============================================================================
+volumes:
+  # PostgreSQL persistent data storage
+  kong_postgres_data:
+    driver: local
